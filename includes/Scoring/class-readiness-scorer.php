@@ -1,0 +1,416 @@
+<?php
+/**
+ * Deterministic AI Readiness scoring engine (0-100).
+ *
+ * Seven weighted checks per product, exactly as specified:
+ *
+ *  | Check      | Weight | What it validates                                    |
+ *  |------------|--------|------------------------------------------------------|
+ *  | REQ_CORE   | 25     | Title, positive price, valid stock status            |
+ *  | BRAND      | 15     | Resolved brand (required by OpenAI spec)             |
+ *  | IMAGE_FMT  | 15     | Featured image JPEG/PNG and >= 500x500               |
+ *  | DESC_LEN   | 15     | Clean description between 120 and 5000 chars         |
+ *  | GTIN_MPN   | 10     | Valid GTIN (Modulo-10) or non-empty MPN              |
+ *  | ATTRS      | 10     | At least 2 structured attributes                     |
+ *  | FAQ_SCHEMA | 10     | At least 2 conversational Q&A pairs in _acpfw_faqs   |
+ *
+ * Results are stored on the parent product as:
+ *  - _acpfw_readiness_score (int 0-100)
+ *  - _acpfw_readiness_issues (array of issue codes)
+ *
+ * @package ACPFW
+ */
+
+defined( 'ABSPATH' ) || exit;
+
+/**
+ * Scores products for AI channel readiness.
+ */
+final class ACPFW_Readiness_Scorer {
+
+        const MIN_DESC_CHARS = 120;
+        const MAX_DESC_CHARS = 5000;
+        const MIN_IMAGE_PX   = 500;
+
+        /**
+         * Register scoring hooks.
+         *
+         * @return void
+         */
+        public static function init() {
+                // WC CRUD saves (admin + REST) always fire this after meta is stored.
+                add_action( 'woocommerce_update_product', array( __CLASS__, 'on_product_saved' ), 20 );
+                // Non-WC saves (imports, quick edit) come through save_post_product;
+                // scoring is idempotent so double-firing is safe.
+                add_action( 'save_post_product', array( __CLASS__, 'on_save_post' ), 20, 2 );
+                // Continuation runner for time-boxed bulk scoring of huge catalogs.
+                add_action( 'acpfw_bulk_score_continue', array( __CLASS__, 'run_bulk_score_continuation' ), 10, 1 );
+        }
+
+        /**
+         * woocommerce_update_product handler.
+         *
+         * @param int $product_id Product ID.
+         * @return void
+         */
+        public static function on_product_saved( $product_id ) {
+                self::score_product( $product_id );
+        }
+
+        /**
+         * save_post_product handler.
+         *
+         * @param int     $post_id Post ID.
+         * @param WP_Post $post    Post object.
+         * @return void
+         */
+        public static function on_save_post( $post_id, $post ) {
+                if ( ! $post instanceof WP_Post || 'product' !== $post->post_type ) {
+                        return;
+                }
+
+                if ( wp_is_post_revision( $post_id ) || wp_is_post_autosave( $post_id ) ) {
+                        return;
+                }
+
+                if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) {
+                        return;
+                }
+
+                self::score_product( $post_id );
+        }
+
+        /**
+         * Human-readable failure message for an issue code.
+         *
+         * When a product ID is supplied, the ATTRS message becomes dynamic:
+         * it names the attributes the product already has and the ones that
+         * would count toward the check, instead of a generic static string.
+         *
+         * @param string $code       Issue code.
+         * @param int    $product_id Optional product ID for dynamic messages.
+         * @return string
+         */
+        public static function get_issue_message( $code, $product_id = 0 ) {
+                switch ( $code ) {
+                        case 'REQ_CORE':
+                                return __( 'Missing price or title (blocked from feed)', 'ai-product-feed-agentic-commerce' );
+                        case 'BRAND':
+                                return __( 'Missing brand (required by OpenAI spec)', 'ai-product-feed-agentic-commerce' );
+                        case 'IMAGE_FMT':
+                                return __( 'Image missing, too small, or WebP only', 'ai-product-feed-agentic-commerce' );
+                        case 'DESC_LEN':
+                                return __( 'Description too thin (< 120 chars) for AI answers', 'ai-product-feed-agentic-commerce' );
+                        case 'GTIN_MPN':
+                                return __( 'Missing valid GTIN or MPN identifier', 'ai-product-feed-agentic-commerce' );
+                        case 'ATTRS':
+                                if ( $product_id > 0 ) {
+                                        return self::get_attrs_message( absint( $product_id ) );
+                                }
+
+                                return __( 'Needs at least 2 structured attributes (material/color/size/gender/age group)', 'ai-product-feed-agentic-commerce' );
+                        case 'FAQ_SCHEMA':
+                                return __( 'No conversational Q&A for AI prompts', 'ai-product-feed-agentic-commerce' );
+                        default:
+                                return $code;
+                }
+        }
+
+        /**
+         * ATTRS check: precise message naming what is present and missing.
+         *
+         * The five recognized attributes mirror the dedicated fields the
+         * feed rows emit (material, color, size, gender, age_group) — store
+         * attributes such as "Logo" are still exported inside variant_dict
+         * but do not count here because ChatGPT has no spec field for them.
+         *
+         * @param int $product_id Product ID.
+         * @return string
+         */
+        private static function get_attrs_message( $product_id ) {
+                $labels = array(
+                        'material'  => __( 'Material', 'ai-product-feed-agentic-commerce' ),
+                        'color'     => __( 'Color', 'ai-product-feed-agentic-commerce' ),
+                        'size'      => __( 'Size', 'ai-product-feed-agentic-commerce' ),
+                        'gender'    => __( 'Gender', 'ai-product-feed-agentic-commerce' ),
+                        'age_group' => __( 'Age group', 'ai-product-feed-agentic-commerce' ),
+                );
+
+                $values  = ACPFW_Product_Mapper::get_scoring_attributes( $product_id );
+                $found   = array();
+                $missing = array();
+
+                foreach ( $labels as $slug => $label ) {
+                        $value = isset( $values[ $slug ] ) ? trim( (string) $values[ $slug ] ) : '';
+
+                        if ( '' !== $value ) {
+                                $found[] = $label;
+                        } else {
+                                $missing[] = $label;
+                        }
+                }
+
+                /*
+                 * Detect "present but unusable" attributes: the product has
+                 * them, but their values can never reach the per-variation
+                 * feed rows (option pool or per-variation values that were
+                 * never saved). Surface a precise hint instead of silently
+                 * counting them as missing.
+                 */
+                $pool = array();
+
+                foreach ( $labels as $slug => $label ) {
+                        if ( in_array( $label, $missing, true ) && ACPFW_Product_Mapper::has_pool_attribute( $product_id, $slug ) ) {
+                                $pool[] = $label;
+                        }
+                }
+
+                if ( ! empty( $found ) && ! empty( $missing ) ) {
+                        $message = sprintf(
+                                /* translators: 1: attribute names the product already has, 2: attribute names that would satisfy the check. */
+                                __( 'Has %1$s — add at least one more AI attribute (%2$s).', 'ai-product-feed-agentic-commerce' ),
+                                implode( ', ', $found ),
+                                implode( ', ', $missing )
+                        );
+
+                        if ( ! empty( $pool ) ) {
+                                $message .= sprintf(
+                                        /* translators: %s: attribute names that exist but cannot reach feed rows. */
+                                        __( ' Note: %s cannot reach the feed rows yet — keep one single value on the product, or set a value on each variation and save.', 'ai-product-feed-agentic-commerce' ),
+                                        implode( ', ', $pool )
+                                );
+                        }
+
+                        return $message;
+                }
+
+                if ( ! empty( $found ) ) {
+                        return __( 'All recognized structured attributes are present.', 'ai-product-feed-agentic-commerce' );
+                }
+
+                return sprintf(
+                        /* translators: %s: comma-separated list of attribute names. */
+                        __( 'Add at least 2 structured attributes (%s).', 'ai-product-feed-agentic-commerce' ),
+                        implode( ', ', array_values( $labels ) )
+                );
+        }
+
+        /**
+         * Score one product and persist the result.
+         *
+         * @param int $product_id Product ID.
+         * @return array [ score (int), issues (string[] ) ].
+         */
+        public static function score_product( $product_id ) {
+                $product_id = absint( $product_id );
+                $product    = wc_get_product( $product_id );
+
+                if ( ! $product instanceof WC_Product ) {
+                        return array( 0, array( 'REQ_CORE' ) );
+                }
+
+                $issues = array();
+                $score  = 0;
+
+                // ---- REQ_CORE (25 pts): title + positive price + stock status.
+                $has_title = '' !== trim( (string) $product->get_name() );
+
+                if ( $product->is_type( 'variable' ) ) {
+                        $min_price = $product->get_variation_price( 'min', true );
+                        $has_price = ( null !== $min_price && (float) $min_price > 0 );
+                } else {
+                        $has_price = (float) $product->get_price() > 0;
+                }
+
+                $has_stock = '' !== (string) $product->get_stock_status();
+
+                if ( $has_title && $has_price && $has_stock ) {
+                        $score += 25;
+                } else {
+                        $issues[] = 'REQ_CORE';
+                }
+
+                // ---- BRAND (15 pts).
+                if ( '' !== ACPFW_Product_Mapper::get_resolved_brand( $product_id ) ) {
+                        $score += 15;
+                } else {
+                        $issues[] = 'BRAND';
+                }
+
+                // ---- IMAGE_FMT (15 pts): compliant resolved image >= 500x500.
+                if ( self::check_image( $product_id ) ) {
+                        $score += 15;
+                } else {
+                        $issues[] = 'IMAGE_FMT';
+                }
+
+                // ---- DESC_LEN (15 pts): 120-5000 clean characters.
+                $description = wp_strip_all_tags( strip_shortcodes( (string) $product->get_description() ) );
+                $desc_length = function_exists( 'mb_strlen' ) ? mb_strlen( trim( $description ) ) : strlen( trim( $description ) );
+
+                if ( $desc_length >= self::MIN_DESC_CHARS && $desc_length <= self::MAX_DESC_CHARS ) {
+                        $score += 15;
+                } else {
+                        $issues[] = 'DESC_LEN';
+                }
+
+                // ---- GTIN_MPN (10 pts): valid GTIN or non-empty MPN.
+                $identifiers = ACPFW_Product_Mapper::get_scoring_identifiers( $product_id );
+                if ( ! empty( $identifiers['has_gtin'] ) || ! empty( $identifiers['has_mpn'] ) ) {
+                        $score += 10;
+                } else {
+                        $issues[] = 'GTIN_MPN';
+                }
+
+                // ---- ATTRS (10 pts): at least 2 structured attributes.
+                $attributes = ACPFW_Product_Mapper::get_scoring_attributes( $product_id );
+                $filled     = 0;
+
+                foreach ( $attributes as $value ) {
+                        if ( '' !== $value && null !== $value ) {
+                                $filled++;
+                        }
+                }
+
+                if ( $filled >= 2 ) {
+                        $score += 10;
+                } else {
+                        $issues[] = 'ATTRS';
+                }
+
+                // ---- FAQ_SCHEMA (10 pts): at least 2 Q&A pairs.
+                $faqs = get_post_meta( $product_id, '_acpfw_faqs', true );
+                if ( is_array( $faqs ) && count( $faqs ) >= 2 ) {
+                        $score += 10;
+                } else {
+                        $issues[] = 'FAQ_SCHEMA';
+                }
+
+                // Persist.
+                update_post_meta( $product_id, '_acpfw_readiness_score', (int) $score );
+                update_post_meta( $product_id, '_acpfw_readiness_issues', $issues );
+
+                /**
+                 * Fires after a product's readiness score is recalculated.
+                 *
+                 * @param int   $product_id Product ID.
+                 * @param int   $score      New score.
+                 * @param array $issues     Issue codes.
+                 */
+                do_action( 'acpfw_score_recalculated', $product_id, $score, $issues );
+
+                return array( (int) $score, $issues );
+        }
+
+        /**
+         * Bulk score every published product (paged, memory-safe).
+         *
+         * Time-boxed: on catalogs too large to finish inside one request the
+         * remaining pages are handed to Action Scheduler (bundled with
+         * WooCommerce) via the acpfw_bulk_score_continue job, so an admin
+         * button can never wedge a PHP-FPM worker into a timeout.
+         *
+         * @param int $start_page Catalog page to start from (continuation runs).
+         * @return int Number of products scored in this run.
+         */
+        public static function bulk_score_all( $start_page = 1 ) {
+                $count   = 0;
+                $page    = max( 1, (int) $start_page );
+                $started = microtime( true );
+
+                do {
+                        $product_ids = wc_get_products(
+                                array(
+                                        'status'  => 'publish',
+                                        'limit'   => 100,
+                                        'page'    => $page,
+                                        'orderby' => 'ID',
+                                        'order'   => 'ASC',
+                                        'return'  => 'ids',
+                                )
+                        );
+
+                        if ( ! is_array( $product_ids ) ) {
+                                break;
+                        }
+
+                        _prime_post_caches( $product_ids, true, true );
+
+                        foreach ( $product_ids as $product_id ) {
+                                self::score_product( $product_id );
+                                $count++;
+                        }
+
+                        $page++;
+
+                        /*
+                         * ~20s spent and more pages left: schedule the rest and
+                         * report the partial count truthfully.
+                         */
+                        if ( count( $product_ids ) === 100 && ( microtime( true ) - $started ) > 20 && function_exists( 'as_schedule_single_action' ) ) {
+                                as_schedule_single_action( time() + 60, 'acpfw_bulk_score_continue', array( 'page' => $page ), 'acpfw' );
+
+                                break;
+                        }
+                } while ( count( $product_ids ) === 100 );
+
+                return $count;
+        }
+
+        /**
+         * Action Scheduler runner for a deferred bulk-scoring chunk.
+         *
+         * @param array $args Scheduled args: page.
+         * @return void
+         */
+        public static function run_bulk_score_continuation( $args = array() ) {
+                $page = is_array( $args ) && isset( $args['page'] ) ? (int) $args['page'] : 1;
+
+                self::bulk_score_all( $page );
+        }
+
+        /**
+         * IMAGE_FMT check: featured image resolves to JPEG/PNG and is >= 500x500.
+         *
+         * @param int $product_id Product ID.
+         * @return bool
+         */
+        private static function check_image( $product_id ) {
+                $image_id = (int) get_post_thumbnail_id( $product_id );
+
+                if ( ! $image_id ) {
+                        return false;
+                }
+
+                $url = ACPFW_Image_Resolver::get_feed_url( $image_id );
+
+                if ( '' === $url ) {
+                        return false;
+                }
+
+                $path = (string) wp_parse_url( $url, PHP_URL_PATH );
+                $ext  = strtolower( (string) pathinfo( $path, PATHINFO_EXTENSION ) );
+
+                if ( ! in_array( $ext, array( 'jpg', 'jpeg', 'png' ), true ) ) {
+                        return false;
+                }
+
+                $meta = wp_get_attachment_metadata( $image_id );
+
+                $width  = isset( $meta['width'] ) ? (int) $meta['width'] : 0;
+                $height = isset( $meta['height'] ) ? (int) $meta['height'] : 0;
+
+                if ( $width >= self::MIN_IMAGE_PX && $height >= self::MIN_IMAGE_PX ) {
+                        return true;
+                }
+
+                // Fallback through the resized source when meta is missing/incomplete.
+                $src = wp_get_attachment_image_src( $image_id, 'full' );
+
+                if ( is_array( $src ) && (int) $src[1] >= self::MIN_IMAGE_PX && (int) $src[2] >= self::MIN_IMAGE_PX ) {
+                        return true;
+                }
+
+                return false;
+        }
+}
