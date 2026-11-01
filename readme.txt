@@ -1,6 +1,6 @@
-=== AI Product Feed & Agentic Commerce for WooCommerce – ChatGPT, ACP, UCP & LLMs.txt ===
+=== AI Product Feed & Agentic Commerce for WooCommerce ===
 Contributors: rajkdas
-Tags: product feed, ai, agentic commerce, shopping feed, woocommerce, chatgpt, llms.txt, structured data, acp, ucp, product feed manager
+Tags: product feed, chatgpt, agentic commerce, ai, woocommerce
 Requires at least: 6.5
 Tested up to: 7.1
 Requires PHP: 7.4
