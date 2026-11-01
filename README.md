@@ -1,6 +1,6 @@
 # AI Product Feed & Agentic Commerce for WooCommerce
 
-![AI Product Feed & Agentic Commerce for WooCommerce — make your store discoverable to ChatGPT, Perplexity & AI agents](.wordpress-org/banner-1544x500.jpg)
+![AI Product Feed & Agentic Commerce](.wordpress-org/social-preview-1280x640.png)
 
 [![Lint](https://github.com/rajkdas/ai-product-feed-agentic-commerce/actions/workflows/lint.yml/badge.svg)](https://github.com/rajkdas/ai-product-feed-agentic-commerce/actions/workflows/lint.yml)
 ![WordPress](https://img.shields.io/badge/WordPress-6.5%2B-21759B?logo=wordpress&logoColor=white)
